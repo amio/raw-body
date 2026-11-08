@@ -1,0 +1,719 @@
+/*!
+ * raw-body
+ * Copyright(c) 2013-2014 Jonathan Ong
+ * Copyright(c) 2014-2022 Douglas Christopher Wilson
+ * MIT Licensed
+ */
+
+import { AsyncResource } from 'node:async_hooks'
+import { Readable } from 'node:stream'
+import type { ReadableStreamReadResult } from 'node:stream/web'
+import bytes from 'bytes'
+import createError from 'http-errors'
+
+/**
+ * The encoding to decode the body with. `true` decodes as `utf-8`.
+ */
+export type Encoding = string | true
+
+/**
+ * The stream types accepted by `getRawBody`.
+ */
+export type NodeRawBodyStream = NodeJS.ReadableStream | Readable
+
+/**
+ * The stream types accepted by `getRawBodyWeb`.
+ */
+export type WebRawBodyStream = ReadableStream<Uint8Array | string>
+
+/**
+ * A streaming decoder, turning body chunks into a string.
+ */
+export interface Decoder {
+  write (chunk: Buffer): string
+  end (): string | undefined
+}
+
+export interface Options {
+  /**
+   * The expected length of the stream.
+   */
+  length?: number | string | null
+  /**
+   * The byte limit of the body. This is the number of bytes or any string
+   * format supported by `bytes`, for example `1000`, `'500kb'` or `'3mb'`.
+   */
+  limit?: number | string | null
+  /**
+   * The encoding to use to decode the body into a string. By default, a
+   * `Buffer` instance will be returned when no encoding is specified. Most
+   * likely, you want `utf-8`, so setting encoding to `true` will decode as
+   * `utf-8`. You can use any encoding supported by `TextDecoder`.
+   * `false` (or any other falsy value) disables decoding, returning
+   * a `Buffer`.
+   */
+  encoding?: Encoding | false | null
+  /**
+   * A function that receives the encoding and returns the decoder used to
+   * turn the body into a string, instead of the built-in `TextDecoder`.
+   * Compatible with `iconv-lite`'s `getDecoder`. Throwing signals the
+   * encoding is unsupported.
+   */
+  decoder?: (encoding: string) => Decoder
+}
+
+/**
+ * The `type` values of the errors created by `raw-body`.
+ */
+export type RawBodyErrorType =
+  | 'encoding.unsupported'
+  | 'entity.too.large'
+  | 'request.aborted'
+  | 'request.size.invalid'
+  | 'stream.encoding.set'
+  | 'stream.not.readable'
+
+export interface RawBodyError extends Error {
+  /**
+   * The error code, when there is one, e.g. `ECONNABORTED` for
+   * aborted requests.
+   */
+  code?: string
+  /**
+   * The limit in bytes.
+   */
+  limit?: number
+  /**
+   * The expected length of the stream.
+   */
+  length?: number
+  expected?: number
+  /**
+   * The received bytes.
+   */
+  received?: number
+  /**
+   * The encoding.
+   */
+  encoding?: string
+  /**
+   * The corresponding status code for the error. Errors created by
+   * `raw-body` always carry one, but errors passed through from the
+   * stream or a custom decoder may not.
+   */
+  status?: number
+  statusCode?: number
+  /**
+   * The error type. Set on every error created by `raw-body`, but
+   * absent on errors passed through from the stream or a custom
+   * decoder.
+   */
+  type?: RawBodyErrorType
+}
+
+type Callback<T> = (err: RawBodyError | null, body: T) => void
+type InternalCallback = (err?: Error | null, body?: Buffer | string) => void
+type CreateDecoder = (encoding: string) => Decoder
+
+// Error.isError is not yet in the TypeScript lib
+const nativeIsError = (Error as { isError?: (err: unknown) => err is Error }).isError
+
+const isError: (err: unknown) => err is Error = typeof nativeIsError === 'function'
+  ? nativeIsError
+  : function (err: unknown): err is Error { return err instanceof Error }
+
+/**
+ * Check for the node readable stream interface.
+ */
+
+function isNodeReadable (stream: unknown): stream is NodeJS.ReadableStream {
+  return typeof (stream as NodeJS.ReadableStream).on === 'function'
+}
+
+/**
+ * Check for the web ReadableStream interface.
+ */
+
+function isWebReadable (stream: unknown): stream is ReadableStream<Uint8Array | string> {
+  return typeof (stream as ReadableStream).getReader === 'function'
+}
+
+/**
+ * Get the decoder for a given encoding.
+ */
+
+function getDecoder (encoding: string | undefined | null, createDecoder?: CreateDecoder): Decoder | null {
+  if (!encoding) return null
+
+  try {
+    if (createDecoder) return createDecoder(encoding)
+
+    const decoder = new TextDecoder(encoding)
+
+    return {
+      write (chunk) {
+        return decoder.decode(chunk, { stream: true })
+      },
+      end () {
+        return decoder.decode()
+      }
+    }
+  } catch {
+    // the encoding was not found
+    throw createError(415, 'specified encoding unsupported', {
+      encoding,
+      type: 'encoding.unsupported'
+    })
+  }
+}
+
+/**
+ * Create a 413 entity too large error. The properties differ
+ * between the early length check and the streamed limit check.
+ */
+
+function entityTooLargeError (props: { expected?: number, length?: number, limit?: number, received?: number, type?: string }): Error {
+  props.type = 'entity.too.large'
+  return createError(413, 'request entity too large', props)
+}
+
+/**
+ * Create a 400 request aborted error.
+ */
+
+function abortedError (length: number | null, received: number, cause?: unknown): Error {
+  const err = createError(400, 'request aborted', {
+    code: 'ECONNABORTED',
+    expected: length,
+    length,
+    received,
+    type: 'request.aborted'
+  })
+
+  if (cause !== undefined) {
+    err.cause = cause
+  }
+
+  return err
+}
+
+/**
+ * Create a 400 size mismatch error.
+ */
+
+function sizeMismatchError (length: number, received: number): Error {
+  return createError(400, 'request size did not match content length', {
+    expected: length,
+    length,
+    received,
+    type: 'request.size.invalid'
+  })
+}
+
+/**
+ * Create a 500 not readable error.
+ */
+
+function notReadableError (): Error {
+  return createError(500, 'stream is not readable', {
+    type: 'stream.not.readable'
+  })
+}
+
+/**
+ * Create a 500 encoding set error.
+ */
+
+function encodingSetError (): Error {
+  return createError(500, 'stream encoding should not be set', {
+    type: 'stream.encoding.set'
+  })
+}
+
+/**
+ * Validate the total received length and assemble the body.
+ *
+ * @param total exact byte count, when known
+ */
+
+function finish (decoder: Decoder | null, buffer: string | Buffer[], length: number | null, received: number, done: InternalCallback, total?: number): void {
+  if (length !== null && received !== length) {
+    return done(sizeMismatchError(length, received))
+  }
+
+  let string: string | Buffer
+
+  try {
+    if (decoder) {
+      string = buffer + (decoder.end() || '')
+    } else {
+      const chunks = buffer as Uint8Array[]
+      const first = chunks[0]
+
+      // a body delivered in a single chunk, the common case for
+      // small bodies, is handed over as-is instead of copied
+      string = chunks.length === 1
+        ? (Buffer.isBuffer(first) ? first : Buffer.from(first.buffer, first.byteOffset, first.byteLength))
+        : Buffer.concat(chunks, total)
+    }
+  } catch (err) {
+    return done(err as Error)
+  }
+
+  done(null, string)
+}
+
+/**
+ * The reader for a stream type: `readStream` or `readWebStream`.
+ */
+type ReadBody<S> = (stream: S, encoding: string | null, length: number | null, limit: number | null, createDecoder: CreateDecoder | undefined, callback: InternalCallback) => void
+
+/**
+ * Validate the options and read the stream, shared by `getRawBody`
+ * and `getRawBodyWeb`. The reader is passed in, without allocating
+ * an intermediate closure per call.
+ */
+
+function getBody<S> (read: ReadBody<S>, stream: S, options: Readonly<Options> | Encoding | Callback<Buffer> | null | undefined, callback: Callback<Buffer> | Callback<string> | undefined): Promise<Buffer | string> | void {
+  let done = callback as InternalCallback | undefined
+  let opts: Readonly<Options> = (options || {}) as Options
+
+  if (options === true || typeof options === 'string') {
+    // short cut for encoding
+    opts = {
+      encoding: options
+    }
+  }
+
+  if (typeof options === 'function') {
+    done = options as InternalCallback
+    opts = {}
+  }
+
+  // validate callback is a function, if provided
+  if (done !== undefined && typeof done !== 'function') {
+    throw new TypeError('argument callback must be a function')
+  }
+
+  // get encoding, treating any falsy value as "no decoding"
+  const encoding = opts.encoding === true
+    ? 'utf-8'
+    : (opts.encoding || null)
+
+  // validate decoder is a function, if provided
+  if (opts.decoder !== undefined && typeof opts.decoder !== 'function') {
+    throw new TypeError('option decoder must be a function')
+  }
+
+  // convert the limit to an integer
+  const limit = opts.limit == null ? null : bytes.parse(opts.limit)
+
+  // an unparseable limit is a developer error: silently reading
+  // with no limit at all would disable the protection
+  if (opts.limit != null && limit === null) {
+    throw new TypeError('option limit must be a number of bytes or a byte size string')
+  }
+
+  // convert the expected length to an integer.
+  const parsedLength = opts.length != null && !Number.isNaN(Number(opts.length))
+    ? parseInt(String(opts.length), 10)
+    : NaN
+  const length = Number.isNaN(parsedLength) ? null : parsedLength
+
+  const decoder = opts.decoder
+
+  if (done) {
+    // classic callback style
+    read(stream, encoding, length, limit, decoder, bindAsyncContext(done))
+    return
+  }
+
+  return new Promise(function executor (resolve, reject) {
+    read(stream, encoding, length, limit, decoder, function onRead (err, buf) {
+      if (err) return reject(err)
+      resolve(buf as Buffer | string)
+    })
+  })
+}
+
+/**
+ * Gets the entire buffer of a node stream as a `Buffer`, delivered to
+ * the callback. Validates the stream's length against an expected
+ * length and maximum limit. Ideal for parsing request bodies.
+ */
+function getRawBody (stream: NodeRawBodyStream, callback: Callback<Buffer>): void
+/**
+ * Gets the entire buffer of a node stream decoded as a string with the
+ * given encoding, delivered to the callback. Validates the stream's
+ * length against an expected length and maximum limit. Ideal for
+ * parsing request bodies.
+ */
+function getRawBody (stream: NodeRawBodyStream, options: Readonly<Options & { encoding: Encoding }> | Encoding, callback: Callback<string>): void
+/**
+ * Gets the entire buffer of a node stream as a `Buffer`, delivered to
+ * the callback. Validates the stream's length against an expected
+ * length and maximum limit. Ideal for parsing request bodies.
+ */
+function getRawBody (stream: NodeRawBodyStream, options: Readonly<Options> | null, callback: Callback<Buffer>): void
+/**
+ * Gets the entire buffer of a node stream decoded as a string with the
+ * given encoding. Validates the stream's length against an expected
+ * length and maximum limit. Ideal for parsing request bodies.
+ */
+function getRawBody (stream: NodeRawBodyStream, options: Readonly<Options & { encoding: Encoding }> | Encoding): Promise<string>
+/**
+ * Gets the entire buffer of a node stream as a `Buffer`. Validates the
+ * stream's length against an expected length and maximum limit.
+ * Ideal for parsing request bodies.
+ */
+function getRawBody (stream: NodeRawBodyStream, options?: Readonly<Options> | null): Promise<Buffer>
+function getRawBody (stream: NodeRawBodyStream, options?: Readonly<Options> | Encoding | Callback<Buffer> | null, callback?: Callback<Buffer> | Callback<string>): Promise<Buffer | string> | void {
+  // light validation.
+  if (stream === undefined) {
+    throw new TypeError('argument stream is required')
+  }
+
+  if (typeof stream !== 'object' || stream === null || !isNodeReadable(stream)) {
+    throw new TypeError('argument stream must be a node stream')
+  }
+
+  return getBody(readStream, stream, options, callback)
+}
+
+/**
+ * Gets the entire buffer of a web `ReadableStream` as a `Buffer`,
+ * delivered to the callback. Validates the stream's length against an
+ * expected length and maximum limit. Ideal for parsing request bodies.
+ */
+function getRawBodyWeb (stream: WebRawBodyStream, callback: Callback<Buffer>): void
+/**
+ * Gets the entire buffer of a web `ReadableStream` decoded as a string
+ * with the given encoding, delivered to the callback. Validates the
+ * stream's length against an expected length and maximum limit. Ideal
+ * for parsing request bodies.
+ */
+function getRawBodyWeb (stream: WebRawBodyStream, options: Readonly<Options & { encoding: Encoding }> | Encoding, callback: Callback<string>): void
+/**
+ * Gets the entire buffer of a web `ReadableStream` as a `Buffer`,
+ * delivered to the callback. Validates the stream's length against an
+ * expected length and maximum limit. Ideal for parsing request bodies.
+ */
+function getRawBodyWeb (stream: WebRawBodyStream, options: Readonly<Options> | null, callback: Callback<Buffer>): void
+/**
+ * Gets the entire buffer of a web `ReadableStream` decoded as a string
+ * with the given encoding. Validates the stream's length against an
+ * expected length and maximum limit. Ideal for parsing request bodies.
+ */
+function getRawBodyWeb (stream: WebRawBodyStream, options: Readonly<Options & { encoding: Encoding }> | Encoding): Promise<string>
+/**
+ * Gets the entire buffer of a web `ReadableStream` as a `Buffer`.
+ * Validates the stream's length against an expected length and
+ * maximum limit. Ideal for parsing request bodies.
+ */
+function getRawBodyWeb (stream: WebRawBodyStream, options?: Readonly<Options> | null): Promise<Buffer>
+function getRawBodyWeb (stream: WebRawBodyStream, options?: Readonly<Options> | Encoding | Callback<Buffer> | null, callback?: Callback<Buffer> | Callback<string>): Promise<Buffer | string> | void {
+  // light validation.
+  if (stream === undefined) {
+    throw new TypeError('argument stream is required')
+  }
+
+  if (typeof stream !== 'object' || stream === null || !isWebReadable(stream)) {
+    throw new TypeError('argument stream must be a web ReadableStream')
+  }
+
+  return getBody(readWebStream, stream, options, callback)
+}
+
+export default getRawBody
+export { getRawBody, getRawBodyWeb }
+
+/**
+ * Halt a stream.
+ */
+
+function halt (stream: NodeJS.ReadableStream): void {
+  // unpipe everything from the stream
+  stream.unpipe()
+
+  // pause stream
+  stream.pause()
+}
+
+/**
+ * Read the data from the stream.
+ */
+
+function readStream (stream: NodeJS.ReadableStream & { readableEncoding?: string | null }, encoding: string | undefined | null, length: number | null, limit: number | null, createDecoder: CreateDecoder | undefined, callback: InternalCallback): void {
+  let buffer: string | Buffer[] | null
+  let complete = false
+  let sync = true
+
+  // check the length and limit options.
+  // note: we intentionally leave the stream paused,
+  // so users should handle the stream themselves.
+  if (limit !== null && length !== null && length > limit) {
+    return done(entityTooLargeError({ expected: length, length, limit }))
+  }
+
+  // assert the stream encoding is buffer.
+  if (stream.readableEncoding) {
+    // developer error
+    return done(encodingSetError())
+  }
+
+  if (typeof stream.readable !== 'undefined' && !stream.readable) {
+    return done(notReadableError())
+  }
+
+  let received = 0
+  let decoder: Decoder | null
+
+  try {
+    decoder = getDecoder(encoding, createDecoder)
+  } catch (err) {
+    return done(err as Error)
+  }
+
+  buffer = decoder
+    ? ''
+    : []
+
+  // attach listeners
+  stream.on('aborted', onAborted)
+  stream.on('close', onClose)
+  stream.on('data', onData)
+  stream.on('end', onEnd)
+  stream.on('error', onEnd)
+
+  // mark sync section complete
+  sync = false
+
+  function done (...args: Parameters<InternalCallback>): void {
+    // mark complete
+    complete = true
+
+    if (sync) {
+      process.nextTick(invokeCallback)
+    } else {
+      invokeCallback()
+    }
+
+    function invokeCallback (): void {
+      cleanup()
+
+      if (args[0]) {
+        // halt the stream on error
+        halt(stream)
+      }
+
+      callback.apply(null, args)
+    }
+  }
+
+  function onAborted (): void {
+    if (complete) return
+
+    done(abortedError(length, received))
+  }
+
+  function onClose (): void {
+    if (complete) return cleanup()
+
+    // the stream was destroyed before finishing, without emitting
+    // an error: surface an aborted request, like the web path,
+    // instead of never settling
+    done(abortedError(length, received))
+  }
+
+  function onData (chunk: Buffer | string): void {
+    if (complete) return
+
+    // string chunks mean the stream is already decoded: the
+    // readableEncoding assertion covers real streams
+    if (typeof chunk === 'string') {
+      return done(encodingSetError())
+    }
+
+    received += chunk.length
+
+    if (limit !== null && received > limit) {
+      done(entityTooLargeError({ limit, received }))
+    } else if (length !== null && received > length) {
+      // past the declared length: a size mismatch, reported now like
+      // finish() does at stream end, instead of buffering the rest
+      done(sizeMismatchError(length, received))
+    } else if (decoder) {
+      try {
+        buffer += decoder.write(chunk)
+      } catch (err) {
+        done(err as Error)
+      }
+    } else {
+      (buffer as Buffer[]).push(chunk)
+    }
+  }
+
+  function onEnd (err?: Error): void {
+    if (complete) return
+    if (err) return done(err)
+
+    // received is an exact byte count, since string chunks
+    // are rejected on this path
+    finish(decoder, buffer as string | Buffer[], length, received, done, received)
+  }
+
+  function cleanup (): void {
+    buffer = null
+
+    stream.removeListener('aborted', onAborted)
+    stream.removeListener('data', onData)
+    stream.removeListener('end', onEnd)
+    stream.removeListener('error', onEnd)
+    stream.removeListener('close', onClose)
+  }
+}
+
+/**
+ * View a chunk as a Buffer, for a decoder that expects one.
+ */
+
+function toBuffer (chunk: Uint8Array): Buffer {
+  return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+}
+
+/**
+ * Read the data from a web ReadableStream.
+ */
+
+function readWebStream (stream: ReadableStream<Uint8Array | string>, encoding: string | undefined | null, length: number | null, limit: number | null, createDecoder: CreateDecoder | undefined, callback: InternalCallback): void {
+  let buffer: string | Buffer[] | null
+  let reader: ReadableStreamDefaultReader<Uint8Array | string> | null = null
+
+  // check the length and limit options.
+  // note: on error the reader lock is released but the stream is
+  // not cancelled, so users should handle the stream themselves.
+  if (limit !== null && length !== null && length > limit) {
+    return fail(entityTooLargeError({ expected: length, length, limit }))
+  }
+
+  // reject streams locked to another reader. note: cancelled or
+  // fully-read streams cannot be detected portably (no runtime-agnostic
+  // access to the disturbed flag) and read as an empty body
+  if (stream.locked) {
+    return fail(notReadableError())
+  }
+
+  let received = 0
+  let decoder: Decoder | null
+
+  try {
+    decoder = getDecoder(encoding, createDecoder)
+  } catch (err) {
+    return fail(err as Error)
+  }
+
+  buffer = decoder
+    ? ''
+    : []
+
+  reader = stream.getReader()
+
+  read()
+
+  function read (): void {
+    // not .catch: onError must only see read() rejections,
+    // never throws from the user callback inside onRead
+    reader!.read().then(onRead, onError)
+  }
+
+  function onError (err: unknown): void {
+    // map aborts (undici's AbortError, node http's ECONNRESET
+    // 'aborted') like the node path; other resets pass through
+    if (err && ((err as Error).name === 'AbortError' ||
+      ((err as NodeJS.ErrnoException).code === 'ECONNRESET' && (err as Error).message === 'aborted'))) {
+      return done(abortedError(length, received, err))
+    }
+
+    if (isError(err)) {
+      return done(err)
+    }
+
+    // a web stream may error with any value, or none at all:
+    // normalize, so callers always get an Error
+    done(new Error('stream error', { cause: err }))
+  }
+
+  function fail (err: Error): void {
+    // defer, so the callback is never invoked synchronously
+    process.nextTick(done, err)
+  }
+
+  function done (err?: Error | null, string?: Buffer | string): void {
+    buffer = null
+
+    if (reader) {
+      // release the stream, so users can handle the rest themselves
+      reader.releaseLock()
+    }
+
+    callback(err, string)
+  }
+
+  function onRead (result: ReadableStreamReadResult<Uint8Array | string>): void {
+    if (result.done) {
+      // received is an exact byte count on this path
+      return finish(decoder, buffer as string | Buffer[], length, received, done, received)
+    }
+
+    const value = result.value
+
+    // a stream of strings is already decoded, so decoding it
+    // again with the declared encoding would corrupt the data
+    if (decoder && typeof value === 'string') {
+      return done(encodingSetError())
+    }
+
+    let chunk: Uint8Array
+
+    if (typeof value === 'string') {
+      // a string-emitting stream (e.g. TextDecoderStream) is already
+      // text: encode it back to utf-8 bytes
+      chunk = Buffer.from(value)
+    } else if (value instanceof Uint8Array) {
+      // kept as-is, not wrapped in a Buffer: concat and the decoder
+      // both accept a Uint8Array
+      chunk = value
+    } else {
+      return done(new TypeError('stream chunks must be Uint8Array or string'))
+    }
+
+    received += chunk.byteLength
+
+    if (limit !== null && received > limit) {
+      done(entityTooLargeError({ limit, received }))
+    } else if (length !== null && received > length) {
+      // past the declared length: a size mismatch, reported now like
+      // finish() does at stream end, instead of buffering the rest
+      done(sizeMismatchError(length, received))
+    } else {
+      try {
+        if (decoder) {
+          buffer += decoder.write(toBuffer(chunk))
+        } else {
+          // held and assembled at the end, trusting the producer not
+          // to reuse the chunk's memory, like the node path
+          (buffer as Uint8Array[]).push(chunk)
+        }
+      } catch (err) {
+        return done(err as Error)
+      }
+
+      read()
+    }
+  }
+}
+
+function bindAsyncContext (fn: InternalCallback): InternalCallback {
+  const resource = new AsyncResource(fn.name || 'bound-anonymous-fn')
+  return resource.runInAsyncScope.bind(resource, fn, null) as unknown as InternalCallback
+}

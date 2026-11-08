@@ -1,8 +1,123 @@
-unreleased
-==========
+## 4.0.0
 
-  * deps: http-errors@1.8.0
+### ⚠️ Breaking changes
+
+- Remove support for Node <22 - by [@bjohansebas](https://github.com/bjohansebas) in [#156](https://github.com/stream-utils/raw-body/pull/156)
+
+    Node.js versions prior to 22 are no longer supported. This allows the package to migrate to ESM and rely on `require(esm)`, which does not work correctly on earlier versions.
+
+- Migrate to TypeScript and publish as ESM-only - by [@bjohansebas](https://github.com/bjohansebas) in [#157](https://github.com/stream-utils/raw-body/pull/157)
+
+    CommonJS consumers can keep loading the package through `require(esm)`.
+
+- Use native `TextDecoder` instead of `iconv-lite` - by [@bjohansebas](https://github.com/bjohansebas) in [#143](https://github.com/stream-utils/raw-body/pull/143)
+
+    Supported encodings are now those of the [WHATWG Encoding Standard](https://encoding.spec.whatwg.org/#names-and-labels); encodings outside the standard (e.g. UTF-32) now throw a 415 error. `utf-16` no longer detects a big-endian BOM and always decodes as little-endian; use `utf-16be` for big-endian content.
+
+- Remove streams1 support - by [@bjohansebas](https://github.com/bjohansebas) in [#144](https://github.com/stream-utils/raw-body/pull/144) and [#161](https://github.com/stream-utils/raw-body/pull/161)
+
+    Node streams that emit string chunks now error with a 500 `stream.encoding.set` through the callback (previously they were decoded silently, or crashed the process when no encoding was set), matching the web stream path. Streams are expected to implement the readable stream interface (`unpipe`, `pause`).
+
+- Validate the `limit` option - by [@bjohansebas](https://github.com/bjohansebas) in [#162](https://github.com/stream-utils/raw-body/pull/162)
+
+    A `limit` that does not parse to a byte count (e.g. `'banana'`, `NaN`) now throws a `TypeError` instead of silently reading with no limit at all. `limit: null` remains the explicit way to disable the limit.
+
+### 🚀 Improvements
+
+- Support reading WHATWG `ReadableStream` (web streams) through the new `getRawBodyWeb` export - by [@bjohansebas](https://github.com/bjohansebas) in [#148](https://github.com/stream-utils/raw-body/pull/148), [#160](https://github.com/stream-utils/raw-body/pull/160) and [#175](https://github.com/stream-utils/raw-body/pull/175)
+
+    `fetch` `Request`/`Response` bodies, `Blob.stream()`, `TransformStream` readables, and `Readable.toWeb()` bridges can be read with `getRawBodyWeb`, which takes the same options as `getRawBody`; `getRawBody` itself keeps accepting only node streams. Streams already locked, read, or cancelled error with a 500 `stream.not.readable`; client aborts are mapped to the same 400 `request.aborted` error as node streams, with the original error in `cause`; string chunks are accepted without an encoding (UTF-8 `Buffer`), but error with a 500 `stream.encoding.set` when combined with one, since the stream is already decoded; non-byte chunks (e.g. `ArrayBuffer`) error with a `TypeError`. On error the reader lock is released, but the stream is not cancelled; disposing it is up to the caller.
+
+- Add a custom `decoder` option - by [@bjohansebas](https://github.com/bjohansebas) in [#145](https://github.com/stream-utils/raw-body/pull/145)
+
+    A function compatible with `iconv-lite`'s `getDecoder` can be plugged in to decode encodings outside the WHATWG Encoding Standard.
+
+- Use native `stream.unpipe()` and remove the `unpipe` dependency - by [@Phillip9587](https://github.com/Phillip9587) in [#93](https://github.com/stream-utils/raw-body/pull/93)
+
+- Remove the check for a global `Promise` when no callback is provided - by [@bjohansebas](https://github.com/bjohansebas) in [#146](https://github.com/stream-utils/raw-body/pull/146)
+
+- Add a benchmark suite - by [@bjohansebas](https://github.com/bjohansebas) in [#163](https://github.com/stream-utils/raw-body/pull/163)
+
+    `npm run bench` compares the node and web stream paths with realistic request bodies.
+
+- Fail as soon as a stream exceeds its declared `length` - by [@bjohansebas](https://github.com/bjohansebas) in [#172](https://github.com/stream-utils/raw-body/pull/172)
+
+    A body that sends more bytes than its declared `length` now errors with a 400 `request.size.invalid` as soon as the excess arrives, rather than buffering the rest first. This bounds memory to `length` even when no `limit` is set. When both are set, a `length` overrun is reported before the `limit`'s 413.
+
+### 🐞 Bug fixes
+
+- Fix a `length` that does not parse to a number failing every request - by [@bjohansebas](https://github.com/bjohansebas) in [#172](https://github.com/stream-utils/raw-body/pull/172)
+
+    Values like `''` passed the numeric pre-check but parsed to `NaN`, so the size check could never match and every request errored with a 400 `request.size.invalid`. They are now treated as no expected length, like any other unparseable value.
+
+- Fix node streams destroyed without an error never settling - by [@bjohansebas](https://github.com/bjohansebas) in [#158](https://github.com/stream-utils/raw-body/pull/158)
+
+    They now error through the callback / reject the promise with the same 400 `request.aborted` error as the web path, instead of never invoking the callback or settling the promise.
+
+- Fix process crash when a custom `decoder` throws while reading node streams - by [@bjohansebas](https://github.com/bjohansebas) in [#157](https://github.com/stream-utils/raw-body/pull/157)
+
+3.0.2 / 2025-11-21
+======================
+
+  * deps: http-errors@2.0.1
+  * deps: use tilde notation for dependencies
+
+3.0.1 / 2025-09-03
+==================
+
+  * deps: iconv-lite@0.7.0
+    - Avoid false positives in encodingExists by using objects without a prototype
+    - Remove compatibility check for StringDecoder.end method
+  * Fix the engines field to reflect support for Node >= 0.10
+
+3.0.0 / 2024-07-25
+==================
+
+  * deps: iconv-lite@0.6.3
+    - Fix HKSCS encoding to prefer Big5 codes
+    - Fix minor issue in UTF-32 decoder's endianness detection code
+    - Update 'gb18030' encoding to :2005 edition
+
+3.0.0-beta.1 / 2023-02-21
+=========================
+
+  * Change TypeScript argument to `NodeJS.ReadableStream` interface
+  * Drop support for Node.js 0.8
+  * deps: iconv-lite@0.5.2
+    - Add encoding cp720
+    - Add encoding UTF-32
+
+2.5.2 / 2023-02-21
+==================
+
+  * Fix error message for non-stream argument
+
+2.5.1 / 2022-02-28
+==================
+
+  * Fix error on early async hooks implementations
+
+2.5.0 / 2022-02-21
+==================
+
+  * Prevent loss of async hooks context
+  * Prevent hanging when stream is not readable
+  * deps: http-errors@2.0.0
+    - deps: depd@2.0.0
+    - deps: statuses@2.0.1
+
+2.4.3 / 2022-02-14
+==================
+
+  * deps: bytes@3.1.2
+
+2.4.2 / 2021-11-16
+==================
+
+  * deps: bytes@3.1.1
+  * deps: http-errors@1.8.1
     - deps: setprototypeof@1.2.0
+    - deps: toidentifier@1.0.1
 
 2.4.1 / 2019-06-25
 ==================

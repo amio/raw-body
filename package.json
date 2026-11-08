@@ -1,7 +1,7 @@
 {
   "name": "raw-body",
   "description": "Get and validate the raw body of a readable stream.",
-  "version": "2.4.1",
+  "version": "4.0.0",
   "author": "Jonathan Ong <me@jongleberry.com> (http://jongleberry.com)",
   "contributors": [
     "Douglas Christopher Wilson <doug@somethingdoug.com>",
@@ -9,40 +9,55 @@
   ],
   "license": "MIT",
   "repository": "stream-utils/raw-body",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": "./dist/index.js",
   "dependencies": {
-    "bytes": "3.1.0",
-    "http-errors": "1.8.0",
-    "iconv-lite": "0.4.24",
-    "unpipe": "1.0.0"
+    "bytes": "^3.1.2",
+    "http-errors": "^2.0.1"
   },
   "devDependencies": {
-    "bluebird": "3.7.2",
-    "eslint": "7.32.0",
-    "eslint-config-standard": "14.1.1",
-    "eslint-plugin-import": "2.24.2",
-    "eslint-plugin-markdown": "2.2.0",
-    "eslint-plugin-node": "11.1.0",
-    "eslint-plugin-promise": "4.3.1",
-    "eslint-plugin-standard": "4.1.0",
-    "istanbul": "0.4.5",
-    "mocha": "9.1.1",
-    "readable-stream": "2.3.7",
-    "safe-buffer": "5.2.1"
+    "@size-limit/preset-small-lib": "^12.1.0",
+    "@types/bytes": "^3.1.5",
+    "@types/http-errors": "^2.0.5",
+    "@types/node": "^26.1.0",
+    "@vitest/coverage-v8": "^4.1.10",
+    "eslint": "^9.0.0",
+    "iconv-lite": "^0.7.0",
+    "neostandard": "^0.13.0",
+    "size-limit": "^12.1.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10"
   },
   "engines": {
-    "node": ">= 0.8"
+    "node": ">=22"
   },
+  "size-limit": [
+    {
+      "path": "dist/index.js",
+      "limit": "4.56 KB",
+      "ignore": [
+        "node:async_hooks",
+        "node:stream"
+      ]
+    }
+  ],
   "files": [
-    "HISTORY.md",
     "LICENSE",
     "README.md",
-    "index.d.ts",
-    "index.js"
+    "dist/"
   ],
   "scripts": {
-    "lint": "eslint .",
-    "test": "mocha --trace-deprecation --reporter spec --bail --check-leaks test/",
-    "test-ci": "istanbul cover node_modules/mocha/bin/_mocha --report lcovonly -- --trace-deprecation --reporter spec --check-leaks test/",
-    "test-cov": "istanbul cover node_modules/mocha/bin/_mocha -- --trace-deprecation --reporter dot --check-leaks test/"
+    "bench": "vitest bench --run",
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "eslint",
+    "lint:fix": "eslint --fix",
+    "prepublishOnly": "npm run build",
+    "size": "size-limit",
+    "test": "vitest run",
+    "test:ci": "vitest run --coverage --coverage.reporter=lcovonly --coverage.reporter=text",
+    "test:cov": "vitest run --coverage --coverage.reporter=html --coverage.reporter=text",
+    "typecheck": "tsc -p tsconfig.json"
   }
 }

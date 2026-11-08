@@ -1,0 +1,80 @@
+import assert from 'node:assert'
+import { Readable } from 'node:stream'
+import { describe, it } from 'vitest'
+import getRawBody from '../src/index.ts'
+import { withDone } from './support/with-done.ts'
+
+describe('using native streams', function () {
+  it('should read contents', withDone(function (done) {
+    const stream = createStream(Buffer.from('hello, streams!'))
+
+    getRawBody(stream, function (err, buf) {
+      assert.ifError(err)
+      assert.strictEqual(buf.toString(), 'hello, streams!')
+      done()
+    })
+  }))
+
+  it('should read pre-buffered contents', withDone(function (done) {
+    const stream = createStream(Buffer.from('hello, streams!'))
+    stream.push('oh, ')
+
+    getRawBody(stream, function (err, buf) {
+      assert.ifError(err)
+      assert.strictEqual(buf.toString(), 'oh, hello, streams!')
+      done()
+    })
+  }))
+
+  it('should stop the stream on limit', withDone(function (done) {
+    const stream = createStream(Buffer.from('hello, streams!'))
+
+    getRawBody(stream, { limit: 2 }, function (err) {
+      assert.ok(err)
+      assert.strictEqual(err.status, 413)
+      assert.strictEqual(err.limit, 2)
+      process.nextTick(done)
+    })
+  }))
+
+  it('should map streams destroyed without error to request.aborted', withDone(function (done) {
+    const stream = new Readable({ read () {} })
+
+    getRawBody(stream, function (err) {
+      assert.ok(err)
+      assert.strictEqual(err.status, 400)
+      assert.strictEqual(err.type, 'request.aborted')
+      assert.strictEqual(err.code, 'ECONNABORTED')
+      assert.strictEqual(err.received, 7)
+      done()
+    })
+
+    stream.push(Buffer.from('partial'))
+    setTimeout(function () { stream.destroy() }, 10)
+  }))
+
+  it('should throw if stream is not readable', withDone(function (done) {
+    const stream = createStream(Buffer.from('hello, streams!'))
+
+    stream.resume()
+    stream.on('end', function () {
+      getRawBody(stream, function (err) {
+        assert.ok(err)
+        assert.strictEqual(err.status, 500)
+        assert.strictEqual(err.type, 'stream.not.readable')
+        assert.strictEqual(err.message, 'stream is not readable')
+        process.nextTick(done)
+      })
+    })
+  }))
+})
+
+function createStream (buf: Buffer): Readable {
+  const stream = new Readable()
+  stream._read = function () {
+    stream.push(buf)
+    stream.push(null)
+  }
+
+  return stream
+}
